@@ -109,7 +109,12 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
 
       assert json == %{
                "content" => nil,
-               "function_call" => %{"arguments" => "{}", "name" => "hello_world"},
+               "tool_calls" => [
+                 %{
+                   "function" => %{"arguments" => "{}", "name" => "hello_world"},
+                   "type" => "function"
+                 }
+               ],
                "role" => :assistant
              }
     end
@@ -122,10 +127,15 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
 
       assert json == %{
                "content" => nil,
-               "function_call" => %{
-                 "arguments" => "{\"expression\":\"11 + 10\"}",
-                 "name" => "hello_world"
-               },
+               "tool_calls" => [
+                 %{
+                   "function" => %{
+                     "arguments" => "{\"expression\":\"11 + 10\"}",
+                     "name" => "hello_world"
+                   },
+                   "type" => "function"
+                 }
+               ],
                "role" => :assistant
              }
     end
@@ -135,7 +145,7 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
 
       json = ChatMistralAI.for_api(msg)
 
-      assert json == %{"content" => "Hello World!", "name" => "hello_world", "role" => :function}
+      assert json == %{"content" => "Hello World!", "name" => "hello_world", "role" => :tool}
     end
 
     test "works with minimal definition and no parameters" do
@@ -302,13 +312,19 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
       assert struct.status == :incomplete
     end
 
-    test "handles receiving a function_call message" do
+    test "handles receiving a tool_calls message" do
       response = %{
-        "finish_reason" => "function_call",
+        "finish_reason" => "tool_calls",
         "index" => 0,
         "message" => %{
-          "content" => nil,
-          "function_call" => %{"arguments" => "{}", "name" => "hello_world"},
+          "tool_calls" => [
+            %{
+              "function" => %{
+                "arguments" => "{}",
+                "name" => "hello_world"
+              }
+            }
+          ],
           "role" => "assistant"
         }
       }

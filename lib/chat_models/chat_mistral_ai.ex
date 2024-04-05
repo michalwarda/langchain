@@ -7,7 +7,6 @@ defmodule Langchain.ChatModels.ChatMistralAI do
   alias LangChain.Config
   alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.ChatModels.ChatModel
-  alias LangChain.ChatModels.ChatOpenAI
   alias LangChain.Message
   alias LangChain.MessageDelta
   alias LangChain.LangChainError
@@ -122,11 +121,25 @@ defmodule Langchain.ChatModels.ChatMistralAI do
       top_p: mistral.top_p,
       safe_prompt: mistral.safe_prompt,
       stream: mistral.stream,
-      messages: Enum.map(messages, &ChatOpenAI.for_api/1)
+      messages: Enum.map(messages, &ChatMistralAI.for_api/1)
     }
     |> Utils.conditionally_add_to_map(:random_seed, mistral.random_seed)
     |> Utils.conditionally_add_to_map(:max_tokens, mistral.max_tokens)
-    |> Utils.conditionally_add_to_map(:functions, get_functions_for_api(functions))
+    |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(functions))
+  end
+
+  defp get_tools_for_api(nil), do: []
+
+  defp get_tools_for_api(functions) do
+    get_functions_for_api(functions)
+    |> Enum.map(&tool_from_api_function/1)
+  end
+
+  defp tool_from_api_function(api_function) do
+    %{
+      "type" => "function",
+      "function" => api_function
+    }
   end
 
   defp get_functions_for_api(nil), do: []
@@ -143,17 +156,22 @@ defmodule Langchain.ChatModels.ChatMistralAI do
       when is_binary(fun_name) do
     %{
       "role" => :assistant,
-      "function_call" => %{
-        "arguments" => Jason.encode!(msg.arguments),
-        "name" => msg.function_name
-      },
+      "tool_calls" => [
+        %{
+          "type" => "function",
+          "function" => %{
+            "name" => fun_name,
+            "arguments" => Jason.encode!(msg.arguments)
+          }
+        }
+      ],
       "content" => msg.content
     }
   end
 
   def for_api(%Message{role: :function} = msg) do
     %{
-      "role" => :function,
+      "role" => :tool,
       "name" => msg.function_name,
       "content" => msg.content
     }
@@ -370,7 +388,7 @@ defmodule Langchain.ChatModels.ChatMistralAI do
         "model_length" ->
           :length
 
-        "function_call" ->
+        "tool_calls" ->
           :complete
 
         other ->
@@ -378,16 +396,30 @@ defmodule Langchain.ChatModels.ChatMistralAI do
           nil
       end
 
+    # TODO: Handle multiple tool_calls
+
     function_name =
       case delta_body do
-        %{"function_call" => %{"name" => name}} -> name
-        _other -> nil
+        %{"tool_calls" => calls} ->
+          calls |> Enum.at(0) |> Map.get("function") |> Map.get("name")
+
+        _other ->
+          nil
       end
 
     arguments =
       case delta_body do
-        %{"function_call" => %{"arguments" => args}} when is_binary(args) -> args
-        _other -> nil
+        %{"tool_calls" => calls} ->
+          args = calls |> Enum.at(0) |> Map.get("function") |> Map.get("arguments")
+
+          if is_binary(args) do
+            args
+          else
+            nil
+          end
+
+        _other ->
+          nil
       end
 
     # more explicitly interpret the role. We treat a "function_call" as a a role
@@ -418,22 +450,24 @@ defmodule Langchain.ChatModels.ChatMistralAI do
 
   def do_process_response(
         %{
-          "finish_reason" => "function_call",
-          "message" => %{"function_call" => %{"arguments" => raw_args, "name" => name}}
+          "finish_reason" => "tool_calls",
+          "message" => %{"tool_calls" => calls}
         } = data
       ) do
-    case Message.new(%{
-           "role" => "assistant",
-           "function_name" => name,
-           "arguments" => raw_args,
-           "complete" => true,
-           "index" => data["index"]
-         }) do
-      {:ok, message} ->
-        message
+    with call <- calls |> Enum.at(0) do
+      case Message.new(%{
+             "role" => "assistant",
+             "function_name" => call["function"]["name"],
+             "arguments" => call["function"]["arguments"],
+             "complete" => true,
+             "index" => data["index"]
+           }) do
+        {:ok, message} ->
+          message
 
-      {:error, changeset} ->
-        {:error, Utils.changeset_error_to_string(changeset)}
+        {:error, changeset} ->
+          {:error, Utils.changeset_error_to_string(changeset)}
+      end
     end
   end
 
