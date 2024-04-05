@@ -12,6 +12,8 @@ defmodule Langchain.ChatModels.ChatMistralAI do
   alias LangChain.MessageDelta
   alias LangChain.LangChainError
   alias LangChain.Utils
+  alias LangChain.Function
+  alias LangChain.FunctionParam
 
   @behaviour ChatModel
   @receive_timeout 60_000
@@ -113,7 +115,7 @@ defmodule Langchain.ChatModels.ChatMistralAI do
   end
 
   @spec for_api(t, message :: [map()], functions :: [map()]) :: %{atom() => any()}
-  def for_api(%ChatMistralAI{} = mistral, messages, _functions) do
+  def for_api(%ChatMistralAI{} = mistral, messages, functions) do
     %{
       model: mistral.model,
       temperature: mistral.temperature,
@@ -124,6 +126,69 @@ defmodule Langchain.ChatModels.ChatMistralAI do
     }
     |> Utils.conditionally_add_to_map(:random_seed, mistral.random_seed)
     |> Utils.conditionally_add_to_map(:max_tokens, mistral.max_tokens)
+    |> Utils.conditionally_add_to_map(:functions, get_functions_for_api(functions))
+  end
+
+  defp get_functions_for_api(nil), do: []
+
+  defp get_functions_for_api(functions) do
+    Enum.map(functions, &for_api/1)
+  end
+
+  @doc """
+  Convert a LangChain structure to the expected map of data for the OpenAI API.
+  """
+  @spec for_api(Message.t() | Function.t()) :: %{String.t() => any()}
+  def for_api(%Message{role: :assistant, function_name: fun_name} = msg)
+      when is_binary(fun_name) do
+    %{
+      "role" => :assistant,
+      "function_call" => %{
+        "arguments" => Jason.encode!(msg.arguments),
+        "name" => msg.function_name
+      },
+      "content" => msg.content
+    }
+  end
+
+  def for_api(%Message{role: :function} = msg) do
+    %{
+      "role" => :function,
+      "name" => msg.function_name,
+      "content" => msg.content
+    }
+  end
+
+  def for_api(%Message{} = msg) do
+    %{
+      "role" => msg.role,
+      "content" => msg.content
+    }
+  end
+
+  # Function support
+  def for_api(%Function{} = fun) do
+    %{
+      "name" => fun.name,
+      "parameters" => get_parameters(fun)
+    }
+    |> Utils.conditionally_add_to_map("description", fun.description)
+  end
+
+  defp get_parameters(%Function{parameters: [], parameters_schema: nil} = _fun) do
+    %{
+      "type" => "object",
+      "properties" => %{}
+    }
+  end
+
+  defp get_parameters(%Function{parameters: [], parameters_schema: schema} = _fun)
+       when is_map(schema) do
+    schema
+  end
+
+  defp get_parameters(%Function{parameters: params} = _fun) do
+    FunctionParam.to_parameters_schema(params)
   end
 
   @impl ChatModel
@@ -240,7 +305,15 @@ defmodule Langchain.ChatModels.ChatMistralAI do
       headers: get_headers(mistral),
       receive_timeout: mistral.receive_timeout
     )
-    |> Req.post(into: Utils.handle_stream_fn(mistral, &ChatOpenAI.decode_stream/1, &do_process_response/1, callback_fn))
+    |> Req.post(
+      into:
+        Utils.handle_stream_fn(
+          mistral,
+          &ChatOpenAI.decode_stream/1,
+          &do_process_response/1,
+          callback_fn
+        )
+    )
     |> case do
       {:ok, %Req.Response{body: data}} ->
         data
@@ -297,9 +370,24 @@ defmodule Langchain.ChatModels.ChatMistralAI do
         "model_length" ->
           :length
 
+        "function_call" ->
+          :complete
+
         other ->
           Logger.warning("Unsupported finish_reason in delta message. Reason: #{inspect(other)}")
           nil
+      end
+
+    function_name =
+      case delta_body do
+        %{"function_call" => %{"name" => name}} -> name
+        _other -> nil
+      end
+
+    arguments =
+      case delta_body do
+        %{"function_call" => %{"arguments" => args}} when is_binary(args) -> args
+        _other -> nil
       end
 
     # more explicitly interpret the role. We treat a "function_call" as a a role
@@ -316,8 +404,31 @@ defmodule Langchain.ChatModels.ChatMistralAI do
       |> Map.put("role", role)
       |> Map.put("index", index)
       |> Map.put("status", status)
+      |> Map.put("function_name", function_name)
+      |> Map.put("arguments", arguments)
 
     case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, changeset} ->
+        {:error, Utils.changeset_error_to_string(changeset)}
+    end
+  end
+
+  def do_process_response(
+        %{
+          "finish_reason" => "function_call",
+          "message" => %{"function_call" => %{"arguments" => raw_args, "name" => name}}
+        } = data
+      ) do
+    case Message.new(%{
+           "role" => "assistant",
+           "function_name" => name,
+           "arguments" => raw_args,
+           "complete" => true,
+           "index" => data["index"]
+         }) do
       {:ok, message} ->
         message
 
